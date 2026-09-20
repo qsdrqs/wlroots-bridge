@@ -6,8 +6,8 @@
 //! libxkbcommon (pure-Rust / static-musl). For each command we:
 //!
 //! 1. resolve the requested keysyms (base key of a spec, or each char of a
-//!    `type`), build a keymap binding them + the four modifier keys to
-//!    sequential keycodes,
+//!    `type`), use physical US keycodes when all symbols have a placement,
+//!    otherwise build a dynamic symbol keymap for text clients,
 //! 2. write the text to a memfd, upload it via `keymap`,
 //! 3. press modifiers (real keycodes, driven via `modifier_map`), tap the base
 //!    key(s), release in reverse.
@@ -274,8 +274,10 @@ fn tap(kb: &Keyboard, slot: usize) {
     if p.needs_shift {
         kb.key(kb.keymap.shift_code, true);
     }
+    kb.modifiers(if p.needs_shift { 1 } else { 0 });
     kb.key(p.evdev_code, true);
     kb.key(p.evdev_code, false);
+    kb.modifiers(0);
     if p.needs_shift {
         kb.key(kb.keymap.shift_code, false);
     }

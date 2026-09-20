@@ -8,8 +8,8 @@
 //!    x11-bridge's `keymap.rs` (which extracted them from `_mapKey` in
 //!    `cu_linux_executor.js`), so the two bridges accept identical specs.
 //!
-//! 2. **Generate** an XKB keymap *text* that binds a sequence of keysyms to
-//!    sequential keycodes, plus the modifier keys, WITHOUT libxkbcommon. The
+//! 2. **Generate** an XKB keymap *text* using physical US positions for supported
+//!    symbol sets, or dynamic keycodes for Unicode, WITHOUT libxkbcommon. The
 //!    Wayland `zwp_virtual_keyboard_v1` protocol requires the client to upload
 //!    a keymap fd; the compositor compiles the text itself. We hand-roll the
 //!    text (the wtype technique) so the binary stays pure-Rust / static-musl:
@@ -331,7 +331,7 @@ const XKB_KEYCODE_BASE: u32 = 9;
 ///
 /// The `key` request wants the evdev code (= XKB keycode - 8), so the returned
 /// placements carry `xkb_keycode - 8`.
-pub fn generate_keymap(keysyms: &[u32]) -> GeneratedKeymap {
+fn generate_symbol_keymap(keysyms: &[u32]) -> GeneratedKeymap {
     // Modifier keycodes (XKB space).
     let ctrl_kc = XKB_KEYCODE_BASE;
     let shift_kc = XKB_KEYCODE_BASE + 1;
@@ -400,6 +400,93 @@ pub fn generate_keymap(keysyms: &[u32]) -> GeneratedKeymap {
     }
 }
 
+/// Resolve a symbol to its physical position on a US keyboard.
+fn physical_placement(keysym: u32) -> Option<KeyPlacement> {
+    let rows = [
+        (2, "1234567890-=", "!@#$%^&*()_+"),
+        (16, "qwertyuiop[]", "QWERTYUIOP{}"),
+        (30, "asdfghjkl;'`", "ASDFGHJKL:\"~"),
+        (43, "\\", "|"),
+        (44, "zxcvbnm,./", "ZXCVBNM<>?"),
+        (57, " ", " "),
+    ];
+    for (start, plain, shifted) in rows {
+        for (needs_shift, row) in [(false, plain), (true, shifted)] {
+            if let Some(index) = row.chars().position(|ch| u32::from(ch) == keysym) {
+                return Some(KeyPlacement {
+                    evdev_code: start + index as u32,
+                    needs_shift,
+                });
+            }
+        }
+    }
+    let code = match keysym {
+        xkeysym::key::Escape => 1,
+        xkeysym::key::BackSpace => 14,
+        xkeysym::key::Tab => 15,
+        xkeysym::key::Return => 28,
+        xkeysym::key::Control_L => 29,
+        xkeysym::key::Shift_L => 42,
+        xkeysym::key::Shift_R => 54,
+        xkeysym::key::Alt_L => 56,
+        xkeysym::key::Caps_Lock => 58,
+        xkeysym::key::F1..=xkeysym::key::F10 => 59 + keysym - xkeysym::key::F1,
+        xkeysym::key::Num_Lock => 69,
+        xkeysym::key::F11 => 87,
+        xkeysym::key::F12 => 88,
+        xkeysym::key::Control_R => 97,
+        xkeysym::key::Print => 99,
+        xkeysym::key::Alt_R => 100,
+        xkeysym::key::Home => 102,
+        xkeysym::key::Up => 103,
+        xkeysym::key::Prior => 104,
+        xkeysym::key::Left => 105,
+        xkeysym::key::Right => 106,
+        xkeysym::key::End => 107,
+        xkeysym::key::Down => 108,
+        xkeysym::key::Next => 109,
+        xkeysym::key::Insert => 110,
+        xkeysym::key::Delete => 111,
+        xkeysym::key::Pause => 119,
+        xkeysym::key::Super_L => 125,
+        xkeysym::key::Super_R => 126,
+        xkeysym::key::Menu => 127,
+        _ => return None,
+    };
+    Some(KeyPlacement {
+        evdev_code: code,
+        needs_shift: false,
+    })
+}
+
+/// Use physical US keycodes when possible, including for modifiers. VM viewers
+/// forward hardware keycodes rather than the uploaded keymap's symbols.
+/// Other symbol sets retain the dynamic keymap used for Unicode text clients.
+pub fn generate_keymap(keysyms: &[u32]) -> GeneratedKeymap {
+    let Some(placements) = keysyms
+        .iter()
+        .copied()
+        .map(physical_placement)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return generate_symbol_keymap(keysyms);
+    };
+    GeneratedKeymap {
+        text: "xkb_keymap {\n\
+            xkb_keycodes { include \"evdev+aliases(qwerty)\" };\n\
+            xkb_types { include \"complete\" };\n\
+            xkb_compatibility { include \"complete\" };\n\
+            xkb_symbols { include \"pc+us+inet(evdev)\" };\n\
+            };\n"
+            .to_owned(),
+        ctrl_code: 29,
+        shift_code: 42,
+        alt_code: 56,
+        super_code: 125,
+        placements,
+    }
+}
+
 /// The evdev code for a modifier token, within a generated keymap.
 pub fn modifier_evdev_code(keymap: &GeneratedKeymap, token: &str) -> Result<u32> {
     match modifier_keysym_name(token) {
@@ -434,6 +521,50 @@ pub fn modifier_mask(token: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_text_preserves_guest_keycodes() {
+        let syms: Vec<_> = "student"
+            .chars()
+            .map(|ch| keysym_for_char(ch).unwrap())
+            .collect();
+        let km = generate_keymap(&syms);
+        let codes: Vec<_> = km.placements.iter().map(|p| p.evdev_code).collect();
+        assert_eq!(codes, [31, 20, 22, 32, 18, 49, 20]);
+        assert!(km.placements.iter().all(|p| !p.needs_shift));
+        assert_eq!(
+            (km.ctrl_code, km.shift_code, km.alt_code, km.super_code),
+            (29, 42, 56, 125)
+        );
+    }
+
+    #[test]
+    fn physical_shift_levels_share_a_key() {
+        let km = generate_keymap(&[
+            u32::from('a'),
+            u32::from('A'),
+            u32::from('1'),
+            u32::from('!'),
+        ]);
+        let actual: Vec<_> = km
+            .placements
+            .iter()
+            .map(|p| (p.evdev_code, p.needs_shift))
+            .collect();
+        assert_eq!(actual, [(30, false), (30, true), (2, false), (2, true)]);
+    }
+
+    #[test]
+    fn physical_navigation_keys() {
+        let km = generate_keymap(&[
+            xkeysym::key::BackSpace,
+            xkeysym::key::Return,
+            xkeysym::key::Tab,
+            xkeysym::key::Left,
+        ]);
+        let codes: Vec<_> = km.placements.iter().map(|p| p.evdev_code).collect();
+        assert_eq!(codes, [14, 28, 15, 105]);
+    }
 
     #[test]
     fn parses_modifier_chord() {

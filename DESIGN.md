@@ -114,13 +114,23 @@ libxkbcommon (which would break the pure-Rust static build), we **generate the
 XKB keymap text ourselves** (the wtype technique, hand-rolled in
 `src/input/keymap.rs::generate_keymap`):
 
-- We lay out sequential XKB keycodes: four fixed modifier keys (Control, Shift,
+- When all requested symbols have physical US keyboard positions, we upload
+  the standard `evdev+aliases(qwerty)` / `pc+us+inet(evdev)` keymap and send those
+  physical evdev codes, including real modifier positions. Uppercase letters
+  and shifted punctuation press Shift. This supports applications that consume
+  or forward hardware keycodes rather than translated symbols. QEMU GTK is a
+  verified example. The receiving system must use a matching US layout for
+  text to match.
+- Other symbol sets use sequential XKB keycodes: four fixed modifier keys (Control, Shift,
   Alt, Super with proper `modifier_map` entries), then one keycode per requested
   keysym.
-- Each requested keysym is bound at **both** shift levels of its keycode to the
-  exact glyph, so a stray Shift never corrupts it. Modifiers are driven as real
-  keys (wtype's approach), not via the `modifiers()` bitmask - it is more
-  reliable across Sway/Hyprland/Niri.
+- In the dynamic keymap, each requested keysym is bound at **both** shift levels
+  of its keycode to the exact glyph. This retains Unicode input for text
+  clients; dynamic keymaps do not provide Unicode input to VM viewers that
+  forward physical keycodes. A mixed ASCII/Unicode request uses this dynamic
+  path for the entire symbol set.
+- Modifiers are driven with both key events and explicit `modifiers()` state
+  updates, including Shift during typing, as required by niri/Smithay.
 - Named keys use their X keysym name (`Return`, `space`, `F5`); Latin-1 glyphs
   their name (`eacute`) or `U00E9`; CJK/emoji the Unicode symbol name
   (`U597D`, `U1F600`) via the keysym encoding `0x01000000 | codepoint`.

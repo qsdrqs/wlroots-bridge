@@ -136,6 +136,14 @@ wlroots-bridge key-sequence --keys 'ctrl+shift+tab' --repeat 1
 wlroots-bridge type --text 'hello' --delay-ms 12
 ```
 
+Keyboard input uses physical US keycodes when all requested symbols have
+supported positions. This supports applications that consume or forward physical
+keycodes instead of interpreting the uploaded XKB mapping; QEMU GTK is a verified
+example. Text interpreted by the receiving system requires a matching US keyboard
+layout. Other symbol sets, including mixed ASCII/Unicode requests, use dynamic
+XKB mappings for text clients; this does not provide arbitrary Unicode input to
+applications that forward physical keycodes.
+
 See [DESIGN.md](DESIGN.md) for the full subcommand -> JSON output contract, the
 key-spec grammar, the coordinate system, the held-button mechanism, the keymap
 generation approach, and the wlroots-specific contract deviations.
