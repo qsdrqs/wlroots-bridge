@@ -36,7 +36,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 use crate::conn::Conn;
-use crate::output::{ButtonStateResult, DragActionResult, PointerActionResult};
+use crate::output::{ButtonStateResult, DragActionResult, PointerActionResult, Rect};
 use crate::screens;
 
 /// Linux evdev button codes (see linux/input-event-codes.h).
@@ -88,49 +88,73 @@ struct PointerState;
 wayland_client::delegate_noop!(PointerState: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(PointerState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 
-/// The logical bounding box of all outputs: the extent space `motion_absolute`
-/// maps into. Returns `(extent_w, extent_h)` = right/bottom edge of the union.
-fn logical_extents(conn: &Conn) -> Result<(u32, u32)> {
+/// The logical bounding box mapped by an unbound virtual pointer.
+struct LogicalBounds {
+    x: i64,
+    y: i64,
+    width: u32,
+    height: u32,
+}
+
+impl LogicalBounds {
+    fn from_rects(rects: impl IntoIterator<Item = Rect>) -> Result<Self> {
+        let mut rects = rects.into_iter();
+        let first = rects
+            .next()
+            .context("no outputs to derive a coordinate space from")?;
+        let mut min_x = i64::from(first.x);
+        let mut min_y = i64::from(first.y);
+        let mut max_x = min_x + i64::from(first.width);
+        let mut max_y = min_y + i64::from(first.height);
+        for rect in rects {
+            min_x = min_x.min(i64::from(rect.x));
+            min_y = min_y.min(i64::from(rect.y));
+            max_x = max_x.max(i64::from(rect.x) + i64::from(rect.width));
+            max_y = max_y.max(i64::from(rect.y) + i64::from(rect.height));
+        }
+        Ok(Self {
+            x: min_x,
+            y: min_y,
+            width: u32::try_from((max_x - min_x).max(1)).context("output layout too wide")?,
+            height: u32::try_from((max_y - min_y).max(1)).context("output layout too tall")?,
+        })
+    }
+
+    fn position(&self, x: i32, y: i32) -> (u32, u32) {
+        (
+            (i64::from(x) - self.x).clamp(0, i64::from(self.width)) as u32,
+            (i64::from(y) - self.y).clamp(0, i64::from(self.height)) as u32,
+        )
+    }
+}
+
+fn logical_bounds(conn: &Conn) -> Result<LogicalBounds> {
     let entries = screens::enumerate(conn)?;
-    if entries.is_empty() {
-        bail!("no outputs to derive a coordinate space from");
-    }
-    let mut max_x = 0i64;
-    let mut max_y = 0i64;
-    for e in &entries {
+    LogicalBounds::from_rects(entries.iter().map(|e| {
         let g = screens::OutputGeometry::from_entry(e);
-        let s = screens::to_screen(&g, false);
-        max_x = max_x.max(i64::from(s.geometry.x) + i64::from(s.geometry.width));
-        max_y = max_y.max(i64::from(s.geometry.y) + i64::from(s.geometry.height));
-    }
-    Ok((max_x.max(1) as u32, max_y.max(1) as u32))
+        screens::to_screen(&g, false).geometry
+    }))
 }
 
 /// A bound virtual pointer plus the extents its absolute motion maps into.
 struct Pointer {
     pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
-    extent_w: u32,
-    extent_h: u32,
+    bounds: LogicalBounds,
 }
 
 impl Pointer {
     fn create(conn: &Conn, qh: &QueueHandle<PointerState>) -> Result<Self> {
-        let (extent_w, extent_h) = logical_extents(conn)?;
+        let bounds = logical_bounds(conn)?;
         let manager = conn.bind_virtual_pointer_manager(qh)?;
         // No seat hint: the compositor assigns a default seat.
         let pointer = manager.create_virtual_pointer(None, qh, ());
-        Ok(Self {
-            pointer,
-            extent_w,
-            extent_h,
-        })
+        Ok(Self { pointer, bounds })
     }
 
     fn motion_absolute(&self, x: i32, y: i32) {
-        let px = x.clamp(0, self.extent_w as i32) as u32;
-        let py = y.clamp(0, self.extent_h as i32) as u32;
+        let (px, py) = self.bounds.position(x, y);
         self.pointer
-            .motion_absolute(now_ms(), px, py, self.extent_w, self.extent_h);
+            .motion_absolute(now_ms(), px, py, self.bounds.width, self.bounds.height);
     }
 
     fn button(&self, evdev: u32, pressed: bool) {
@@ -506,6 +530,34 @@ unsafe fn install_handler(sig: i32, handler: extern "C" fn(i32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_mapping_is_translation_invariant() {
+        for (dx, dy) in [(0, 0), (-1920, -1080), (200, 300)] {
+            let bounds = LogicalBounds::from_rects([
+                Rect {
+                    x: dx,
+                    y: dy,
+                    width: 1920,
+                    height: 1080,
+                },
+                Rect {
+                    x: dx + 1920,
+                    y: dy + 100,
+                    width: 1280,
+                    height: 720,
+                },
+            ])
+            .unwrap();
+            assert_eq!((bounds.width, bounds.height), (3200, 1080));
+            assert_eq!(bounds.position(dx, dy), (0, 0));
+            assert_eq!(bounds.position(dx + 960, dy + 540), (960, 540));
+            assert_eq!(bounds.position(dx + 2560, dy + 460), (2560, 460));
+            assert_eq!(bounds.position(dx - 10, dy - 10), (0, 0));
+            assert_eq!(bounds.position(dx + 4000, dy + 2000), (3200, 1080));
+        }
+        assert!(LogicalBounds::from_rects([]).is_err());
+    }
 
     #[test]
     fn button_parse_and_evdev() {

@@ -30,5 +30,6 @@ pub fn doctor(conn: &Conn) -> DoctorReport {
         wayland_display,
         compositor: detect_compositor(),
         globals,
+        pointer_logical_bounds: true,
     }
 }

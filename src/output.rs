@@ -196,6 +196,8 @@ pub struct DoctorReport {
     pub wayland_display: String,
     pub compositor: String,
     pub globals: DoctorGlobals,
+    /// Absolute pointer coordinates are relative to the full output bounding box.
+    pub pointer_logical_bounds: bool,
 }
 
 /// Presence + bound version of each global we depend on. `Some(v)` = advertised
